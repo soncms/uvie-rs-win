@@ -323,6 +323,9 @@ mod win {
             app.engine.reset();
             return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
         }
+        if k.vkCode == VK_BACK as u32 && app.engine.restore_after_boundary_backspace() {
+            return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
+        }
         if k.vkCode == VK_BACK as u32 && app.engine.is_composing() {
             let edit = app.engine.backspace_visible();
             apply_edit(app, edit);
@@ -335,7 +338,7 @@ mod win {
         };
 
         if is_break_char(ch) {
-            app.engine.reset();
+            let _ = app.engine.feed(ch);
             return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
         }
 

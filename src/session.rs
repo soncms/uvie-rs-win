@@ -10,6 +10,7 @@ pub enum Edit {
 pub struct SessionEngine {
     raw: String,
     visible: String,
+    before_boundary: Option<(String, String)>,
     quick_telex: bool,
 }
 
@@ -24,6 +25,7 @@ impl SessionEngine {
         Self {
             raw: String::new(),
             visible: String::new(),
+            before_boundary: None,
             quick_telex,
         }
     }
@@ -31,6 +33,7 @@ impl SessionEngine {
     pub fn reset(&mut self) {
         self.raw.clear();
         self.visible.clear();
+        self.before_boundary = None;
     }
 
     pub fn is_composing(&self) -> bool {
@@ -43,7 +46,10 @@ impl SessionEngine {
 
     pub fn feed(&mut self, ch: char) -> Edit {
         if Self::is_boundary(ch) {
-            self.reset();
+            self.before_boundary = (!self.raw.is_empty())
+                .then(|| (self.raw.clone(), self.visible.clone()));
+            self.raw.clear();
+            self.visible.clear();
             return Edit::Pass;
         }
 
@@ -51,6 +57,8 @@ impl SessionEngine {
             self.reset();
             return Edit::Pass;
         }
+
+        self.before_boundary = None;
 
         let before = self.visible.clone();
         let mut candidate_raw = self.raw.clone();
@@ -107,6 +115,15 @@ impl SessionEngine {
             backspaces: 1,
             text: String::new(),
         }
+    }
+
+    pub fn restore_after_boundary_backspace(&mut self) -> bool {
+        let Some((raw, visible)) = self.before_boundary.take() else {
+            return false;
+        };
+        self.raw = raw;
+        self.visible = visible;
+        true
     }
 
     fn render(&self, raw: &str) -> String {
@@ -357,6 +374,25 @@ mod tests {
                 screen.push_str(&text);
             }
         }
+    }
+
+    fn physical_backspace(screen: &mut String, engine: &mut SessionEngine) {
+        if engine.restore_after_boundary_backspace() {
+            screen.pop();
+        } else {
+            backspace(screen, engine);
+        }
+    }
+
+    #[test]
+    fn continues_word_after_space_is_deleted() {
+        let mut e = SessionEngine::default();
+        let mut screen = type_seq(&mut e, "go ");
+        assert_eq!(screen, "go ");
+        physical_backspace(&mut screen, &mut e);
+        assert_eq!(screen, "go");
+        apply(&mut screen, e.feed('o'), 'o');
+        assert_eq!(screen, "gô");
     }
 
     #[test]
