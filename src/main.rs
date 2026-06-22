@@ -13,7 +13,7 @@ mod win {
     use std::ffi::c_void;
     use std::fs;
     use std::mem::{size_of, zeroed};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::ptr::{null, null_mut};
     use uvie_rs_win::session::{Edit, SessionEngine};
@@ -95,10 +95,11 @@ mod win {
     pub fn main() {
         unsafe {
             let instance = GetModuleHandleW(null());
-            let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("uvie-rs-win.exe"));
+            let exe_path =
+                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("uvie-rs-win.exe"));
             let config_path = exe_path
                 .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
+                .unwrap_or_else(|| Path::new("."))
                 .join(CONFIG_FILE);
             let config = load_config(&config_path);
 
@@ -108,7 +109,15 @@ mod win {
 
             let mutex_name = wide(MUTEX_NAME);
             let mutex = CreateMutexW(null(), TRUE, mutex_name.as_ptr());
-            if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
+            if mutex.is_null() {
+                return;
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                message(
+                    null_mut(),
+                    "UVie Rust Win is already running.\n\nExit the tray app before testing a new build.",
+                );
+                CloseHandle(mutex);
                 return;
             }
 
@@ -231,7 +240,12 @@ mod win {
         }
     }
 
-    unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         let app = &mut *APP;
         if msg == app.taskbar_created {
             add_tray_icon(app);
@@ -265,7 +279,7 @@ mod win {
         }
         let app = &mut *APP;
         let k = &*(lparam as *const KBDLLHOOKSTRUCT);
-        if (k.flags & LLKHF_INJECTED as u32) != 0 || k.dwExtraInfo == INJECTED_MARKER {
+        if (k.flags & LLKHF_INJECTED) != 0 || k.dwExtraInfo == INJECTED_MARKER {
             return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
         }
 
@@ -274,7 +288,11 @@ mod win {
         update_modifier_state(app, k.vkCode, msg);
 
         if msg == WM_KEYUP || msg == WM_SYSKEYUP {
-            if was_ctrl_shift && is_ctrl_shift_modifier(k.vkCode) && app.hotkey_armed && !app.hotkey_cancelled {
+            if was_ctrl_shift
+                && is_ctrl_shift_modifier(k.vkCode)
+                && app.hotkey_armed
+                && !app.hotkey_cancelled
+            {
                 toggle_enabled(app);
                 app.hotkey_armed = false;
             }
@@ -306,11 +324,12 @@ mod win {
             return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
         }
         if k.vkCode == VK_BACK as u32 && app.engine.is_composing() {
-            apply_edit(app.engine.backspace_visible());
+            let edit = app.engine.backspace_visible();
+            apply_edit(app, edit);
             return 1;
         }
 
-        let Some(ch) = vk_to_ascii(app, k.vkCode) else {
+        let Some(ch) = vk_to_ascii(app, k.vkCode, k.scanCode) else {
             app.engine.reset();
             return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
         };
@@ -323,7 +342,7 @@ mod win {
         match app.engine.feed(ch) {
             Edit::Pass => CallNextHookEx(app.keyboard_hook, code, wparam, lparam),
             edit => {
-                apply_edit(edit);
+                apply_edit(app, edit);
                 1
             }
         }
@@ -359,54 +378,116 @@ mod win {
         }
     }
 
-    unsafe fn apply_edit(edit: Edit) {
+    unsafe fn apply_edit(app: &mut App, edit: Edit) {
         match edit {
             Edit::Pass => {}
             Edit::Replace { backspaces, text } => {
-                send_backspaces(backspaces);
-                send_text(&text);
+                if !send_replacement(backspaces, &text) {
+                    app.engine.reset();
+                }
             }
         }
     }
 
-    unsafe fn send_backspaces(count: usize) {
-        let mut inputs = Vec::with_capacity(count * 2);
+    unsafe fn send_replacement(backspaces: usize, text: &str) -> bool {
+        let mut inputs = Vec::with_capacity((backspaces + text.encode_utf16().count()) * 2 + 2);
+        // ponytail: this treats all Thorium text fields as Omnibox-like. Upgrade
+        // to UI Automation focused-control detection if mid-text edits regress.
+        if backspaces > 0 && is_foreground_process("thorium.exe") {
+            append_key(&mut inputs, VK_DELETE);
+        }
+        append_backspaces(&mut inputs, backspaces);
+        append_text(&mut inputs, text);
+        send_inputs(&mut inputs)
+    }
+
+    fn append_backspaces(inputs: &mut Vec<INPUT>, count: usize) {
         for _ in 0..count {
-            let mut down: INPUT = zeroed();
-            down.r#type = INPUT_KEYBOARD;
-            down.Anonymous.ki.wVk = VK_BACK as u16;
-            down.Anonymous.ki.dwExtraInfo = INJECTED_MARKER;
-            let mut up = down;
-            up.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+            let down = keyboard_input(VK_BACK, 0, 0);
+            let up = keyboard_input(VK_BACK, 0, KEYEVENTF_KEYUP);
             inputs.push(down);
             inputs.push(up);
         }
-        send_inputs(&mut inputs);
     }
 
-    unsafe fn send_text(text: &str) {
-        let mut inputs = Vec::new();
+    fn append_key(inputs: &mut Vec<INPUT>, vk: VIRTUAL_KEY) {
+        inputs.push(keyboard_input(vk, 0, 0));
+        inputs.push(keyboard_input(vk, 0, KEYEVENTF_KEYUP));
+    }
+
+    fn append_text(inputs: &mut Vec<INPUT>, text: &str) {
         for unit in text.encode_utf16() {
-            let mut down: INPUT = zeroed();
-            down.r#type = INPUT_KEYBOARD;
-            down.Anonymous.ki.wScan = unit;
-            down.Anonymous.ki.dwFlags = KEYEVENTF_UNICODE;
-            down.Anonymous.ki.dwExtraInfo = INJECTED_MARKER;
-            let mut up = down;
-            up.Anonymous.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+            let down = keyboard_input(0, unit, KEYEVENTF_UNICODE);
+            let up = keyboard_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
             inputs.push(down);
             inputs.push(up);
         }
-        send_inputs(&mut inputs);
     }
 
-    unsafe fn send_inputs(inputs: &mut [INPUT]) {
-        if !inputs.is_empty() {
-            SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32);
+    fn keyboard_input(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        let mut input: INPUT = unsafe { zeroed() };
+        input.r#type = INPUT_KEYBOARD;
+        input.Anonymous.ki.wVk = vk;
+        input.Anonymous.ki.wScan = scan;
+        input.Anonymous.ki.dwFlags = flags;
+        input.Anonymous.ki.dwExtraInfo = INJECTED_MARKER;
+        input
+    }
+
+    unsafe fn send_inputs(inputs: &mut [INPUT]) -> bool {
+        if inputs.is_empty() {
+            return true;
         }
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            size_of::<INPUT>() as i32,
+        ) == inputs.len() as u32
     }
 
-    unsafe fn vk_to_ascii(app: &App, vk: u32) -> Option<char> {
+    unsafe fn current_keyboard_layout() -> HKL {
+        let hwnd = GetForegroundWindow();
+        if !hwnd.is_null() {
+            let thread_id = GetWindowThreadProcessId(hwnd, null_mut());
+            if thread_id != 0 {
+                return GetKeyboardLayout(thread_id);
+            }
+        }
+        GetKeyboardLayout(0)
+    }
+
+    unsafe fn is_foreground_process(name: &str) -> bool {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return false;
+        }
+
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if process.is_null() {
+            return false;
+        }
+
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(process);
+        if !ok || len == 0 {
+            return false;
+        }
+
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|exe| exe.eq_ignore_ascii_case(name))
+    }
+
+    unsafe fn vk_to_ascii(app: &App, vk: u32, scan: u32) -> Option<char> {
         let mut state = [0u8; 256];
         if GetKeyboardState(state.as_mut_ptr()) == 0 {
             return None;
@@ -415,8 +496,7 @@ mod win {
         state[VK_CONTROL as usize] = if app.ctrl_down { 0x80 } else { 0 };
         state[VK_MENU as usize] = if app.alt_down { 0x80 } else { 0 };
 
-        let layout = GetKeyboardLayout(0);
-        let scan = MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, layout);
+        let layout = current_keyboard_layout();
         let mut buf = [0u16; 8];
         let n = ToUnicodeEx(vk, scan, state.as_ptr(), buf.as_mut_ptr(), 7, 0, layout);
         if n != 1 {
@@ -502,7 +582,12 @@ mod win {
         app.menu = CreatePopupMenu();
         AppendMenuW(
             app.menu,
-            MF_STRING | if app.config.enabled { MF_CHECKED } else { MF_UNCHECKED },
+            MF_STRING
+                | if app.config.enabled {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
             MENU_TOGGLE,
             wide("Bật Tiếng Việt").as_ptr(),
         );
@@ -616,7 +701,7 @@ mod win {
         }
     }
 
-    fn set_hkcu_run(enabled: bool, exe: &PathBuf) -> bool {
+    fn set_hkcu_run(enabled: bool, exe: &Path) -> bool {
         unsafe {
             let mut key = null_mut();
             let path = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -654,7 +739,7 @@ mod win {
         }
     }
 
-    fn set_task(exe: &PathBuf) -> bool {
+    fn set_task(exe: &Path) -> bool {
         Command::new("schtasks")
             .args([
                 "/Create",
@@ -683,7 +768,7 @@ mod win {
             .unwrap_or(true)
     }
 
-    unsafe fn relaunch(exe: &PathBuf, admin: bool) -> bool {
+    unsafe fn relaunch(exe: &Path, admin: bool) -> bool {
         let exe_w = wide(&exe.to_string_lossy());
         if admin {
             ShellExecuteW(
@@ -855,6 +940,68 @@ mod win {
         fn creation_flags(&mut self, flags: u32) -> &mut Self {
             use std::os::windows::process::CommandExt;
             CommandExt::creation_flags(self, flags)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn backspace_inputs_use_virtual_key_and_marker() {
+            let mut inputs = Vec::new();
+            append_backspaces(&mut inputs, 1);
+
+            assert_eq!(inputs.len(), 2);
+            assert_eq!(inputs[0].r#type, INPUT_KEYBOARD);
+            unsafe {
+                assert_eq!(inputs[0].Anonymous.ki.wVk, VK_BACK);
+                assert_eq!(inputs[0].Anonymous.ki.wScan, 0);
+                assert_eq!(inputs[0].Anonymous.ki.dwFlags, 0);
+                assert_eq!(inputs[0].Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
+                assert_eq!(inputs[1].Anonymous.ki.wVk, VK_BACK);
+                assert_eq!(inputs[1].Anonymous.ki.wScan, 0);
+                assert_eq!(inputs[1].Anonymous.ki.dwFlags, KEYEVENTF_KEYUP);
+                assert_eq!(inputs[1].Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
+            }
+        }
+
+        #[test]
+        fn thorium_replacement_clears_inline_selection_first() {
+            let mut inputs = Vec::new();
+            append_key(&mut inputs, VK_DELETE);
+            append_backspaces(&mut inputs, 1);
+            append_text(&mut inputs, "â");
+
+            assert_eq!(inputs.len(), 6);
+            unsafe {
+                assert_eq!(inputs[0].Anonymous.ki.wVk, VK_DELETE);
+                assert_eq!(inputs[1].Anonymous.ki.wVk, VK_DELETE);
+                assert_eq!(inputs[2].Anonymous.ki.wVk, VK_BACK);
+                assert_eq!(inputs[3].Anonymous.ki.wVk, VK_BACK);
+                assert_eq!(inputs[4].Anonymous.ki.wScan, 'â' as u16);
+                assert_eq!(inputs[4].Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
+            }
+        }
+
+        #[test]
+        fn text_inputs_use_unicode_and_marker() {
+            let mut inputs = Vec::new();
+            append_text(&mut inputs, "â");
+
+            assert_eq!(inputs.len(), 2);
+            assert_eq!(inputs[0].r#type, INPUT_KEYBOARD);
+            unsafe {
+                assert_eq!(inputs[0].Anonymous.ki.wVk, 0);
+                assert_eq!(inputs[0].Anonymous.ki.wScan, 'â' as u16);
+                assert_eq!(inputs[0].Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
+                assert_eq!(inputs[0].Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
+                assert_eq!(
+                    inputs[1].Anonymous.ki.dwFlags,
+                    KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                );
+                assert_eq!(inputs[1].Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
+            }
         }
     }
 }

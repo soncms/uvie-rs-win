@@ -57,11 +57,11 @@ impl SessionEngine {
         candidate_raw.push(ch);
         let mut candidate = self.render(&candidate_raw);
 
-        if let Some((normalized_raw, normalized)) = self.normalize_early_tone(&candidate_raw) {
-            if score_render(&normalized) > score_render(&candidate) {
-                candidate_raw = normalized_raw;
-                candidate = normalized;
-            }
+        if let Some((normalized_raw, normalized)) = self.normalize_early_tone(&candidate_raw)
+            && score_render(&normalized) > score_render(&candidate)
+        {
+            candidate_raw = normalized_raw;
+            candidate = normalized;
         }
 
         if self.should_restore_raw(ch, &candidate_raw, &candidate) {
@@ -78,12 +78,11 @@ impl SessionEngine {
             return Edit::Pass;
         }
 
-        let (backspaces, text) = diff(&before, &candidate);
         self.raw = candidate_raw;
         self.visible = candidate;
 
-        let original = ch.to_string();
-        if backspaces == 0 && text == original {
+        let (backspaces, text) = diff(&before, &self.visible);
+        if backspaces == 0 && text == ch.to_string() {
             Edit::Pass
         } else {
             Edit::Replace { backspaces, text }
@@ -148,7 +147,11 @@ impl SessionEngine {
             .enumerate()
             .rev()
             .find_map(|(i, ch)| is_tone_key(*ch).then_some(i))?;
-        if tone_pos + 1 >= chars.len() || !chars[tone_pos + 1..].iter().all(|ch| ch.is_ascii_alphabetic()) {
+        if tone_pos + 1 >= chars.len()
+            || !chars[tone_pos + 1..]
+                .iter()
+                .all(|ch| ch.is_ascii_alphabetic())
+        {
             return None;
         }
         if !has_u_horn_before(&chars, tone_pos) {
@@ -287,7 +290,10 @@ fn is_impossible_single_o_coda(ch: char) -> bool {
 }
 
 fn is_tone_key(ch: char) -> bool {
-    matches!(ch, 's' | 'f' | 'r' | 'x' | 'j' | 'S' | 'F' | 'R' | 'X' | 'J')
+    matches!(
+        ch,
+        's' | 'f' | 'r' | 'x' | 'j' | 'S' | 'F' | 'R' | 'X' | 'J'
+    )
 }
 
 fn score_render(s: &str) -> usize {
@@ -360,6 +366,21 @@ mod tests {
         assert_eq!(screen, "gô");
         backspace(&mut screen, &mut e);
         assert_eq!(screen, "g");
+    }
+
+    #[test]
+    fn unchanged_ascii_keys_pass_through_while_tracking_state() {
+        let mut e = SessionEngine::default();
+        assert_eq!(e.feed('a'), Edit::Pass);
+        assert_eq!(e.visible(), "a");
+        assert_eq!(
+            e.feed('a'),
+            Edit::Replace {
+                backspaces: 1,
+                text: "â".to_string(),
+            }
+        );
+        assert_eq!(e.visible(), "â");
     }
 
     #[test]
