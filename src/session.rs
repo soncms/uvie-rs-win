@@ -44,10 +44,14 @@ impl SessionEngine {
         &self.visible
     }
 
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
     pub fn feed(&mut self, ch: char) -> Edit {
         if Self::is_boundary(ch) {
-            self.before_boundary = (!self.raw.is_empty())
-                .then(|| (self.raw.clone(), self.visible.clone()));
+            self.before_boundary =
+                (!self.raw.is_empty()).then(|| (self.raw.clone(), self.visible.clone()));
             self.raw.clear();
             self.visible.clear();
             return Edit::Pass;

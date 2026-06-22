@@ -12,10 +12,14 @@ mod win {
     use serde::{Deserialize, Serialize};
     use std::ffi::c_void;
     use std::fs;
+    use std::io::Write;
     use std::mem::{size_of, zeroed};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::ptr::{null, null_mut};
+    use uvie_rs_win::context::current_app_context;
+    use uvie_rs_win::injector::{self, INJECTED_MARKER, Replacement};
+    use uvie_rs_win::profile::{InjectionStrategy, resolve_profile};
     use uvie_rs_win::session::{Edit, SessionEngine};
     use windows_sys::Win32::Foundation::*;
     use windows_sys::Win32::Graphics::Gdi::*;
@@ -42,7 +46,6 @@ mod win {
     const MENU_ABOUT: usize = 1004;
     const MENU_EXIT: usize = 1005;
     const TRAY_ID: u32 = 1;
-    const INJECTED_MARKER: usize = 0x5556_4945;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -52,6 +55,8 @@ mod win {
         run_as_admin: bool,
         hotkey: String,
         quick_telex: bool,
+        #[serde(default)]
+        debug_log: bool,
     }
 
     impl Default for Config {
@@ -62,6 +67,7 @@ mod win {
                 run_as_admin: false,
                 hotkey: "Ctrl+Shift".to_string(),
                 quick_telex: false,
+                debug_log: false,
             }
         }
     }
@@ -82,6 +88,7 @@ mod win {
         engine: SessionEngine,
         exe_path: PathBuf,
         config_path: PathBuf,
+        log_path: PathBuf,
         ctrl_down: bool,
         shift_down: bool,
         alt_down: bool,
@@ -101,6 +108,10 @@ mod win {
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(CONFIG_FILE);
+            let log_path = exe_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("uvie-rs-win.log");
             let config = load_config(&config_path);
 
             if config.run_as_admin && !is_elevated() && relaunch(&exe_path, true) {
@@ -137,6 +148,7 @@ mod win {
                 config,
                 exe_path,
                 config_path,
+                log_path,
                 ctrl_down: false,
                 shift_down: false,
                 alt_down: false,
@@ -385,67 +397,47 @@ mod win {
         match edit {
             Edit::Pass => {}
             Edit::Replace { backspaces, text } => {
-                if !send_replacement(backspaces, &text) {
+                let context = current_app_context();
+                let profile = resolve_profile(&context);
+                let replacement = Replacement::new(backspaces, text);
+                log_replacement(app, &context, profile.strategy, &replacement);
+                if !injector::send_replacement(profile.strategy, &replacement) {
                     app.engine.reset();
                 }
             }
         }
     }
 
-    unsafe fn send_replacement(backspaces: usize, text: &str) -> bool {
-        let mut inputs = Vec::with_capacity((backspaces + text.encode_utf16().count()) * 2 + 2);
-        // ponytail: this treats all Thorium text fields as Omnibox-like. Upgrade
-        // to UI Automation focused-control detection if mid-text edits regress.
-        if backspaces > 0 && is_foreground_process("thorium.exe") {
-            append_key(&mut inputs, VK_DELETE);
+    fn log_replacement(
+        app: &App,
+        context: &uvie_rs_win::context::AppContext,
+        strategy: InjectionStrategy,
+        replacement: &Replacement,
+    ) {
+        if !app.config.debug_log {
+            return;
         }
-        append_backspaces(&mut inputs, backspaces);
-        append_text(&mut inputs, text);
-        send_inputs(&mut inputs)
-    }
 
-    fn append_backspaces(inputs: &mut Vec<INPUT>, count: usize) {
-        for _ in 0..count {
-            let down = keyboard_input(VK_BACK, 0, 0);
-            let up = keyboard_input(VK_BACK, 0, KEYEVENTF_KEYUP);
-            inputs.push(down);
-            inputs.push(up);
+        let exe = context.exe_name.as_deref().unwrap_or("<unknown>");
+        let title = context.window_title.as_deref().unwrap_or("");
+        let line = format!(
+            "exe={} title=\"{}\" strategy={:?} raw=\"{}\" visible=\"{}\" edit=Replace({},\"{}\")\n",
+            exe,
+            title.replace('"', "'"),
+            strategy,
+            app.engine.raw().replace('"', "'"),
+            app.engine.visible().replace('"', "'"),
+            replacement.backspaces,
+            replacement.text.replace('"', "'")
+        );
+
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&app.log_path)
+        {
+            let _ = file.write_all(line.as_bytes());
         }
-    }
-
-    fn append_key(inputs: &mut Vec<INPUT>, vk: VIRTUAL_KEY) {
-        inputs.push(keyboard_input(vk, 0, 0));
-        inputs.push(keyboard_input(vk, 0, KEYEVENTF_KEYUP));
-    }
-
-    fn append_text(inputs: &mut Vec<INPUT>, text: &str) {
-        for unit in text.encode_utf16() {
-            let down = keyboard_input(0, unit, KEYEVENTF_UNICODE);
-            let up = keyboard_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
-            inputs.push(down);
-            inputs.push(up);
-        }
-    }
-
-    fn keyboard_input(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
-        let mut input: INPUT = unsafe { zeroed() };
-        input.r#type = INPUT_KEYBOARD;
-        input.Anonymous.ki.wVk = vk;
-        input.Anonymous.ki.wScan = scan;
-        input.Anonymous.ki.dwFlags = flags;
-        input.Anonymous.ki.dwExtraInfo = INJECTED_MARKER;
-        input
-    }
-
-    unsafe fn send_inputs(inputs: &mut [INPUT]) -> bool {
-        if inputs.is_empty() {
-            return true;
-        }
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            size_of::<INPUT>() as i32,
-        ) == inputs.len() as u32
     }
 
     unsafe fn current_keyboard_layout() -> HKL {
@@ -457,37 +449,6 @@ mod win {
             }
         }
         GetKeyboardLayout(0)
-    }
-
-    unsafe fn is_foreground_process(name: &str) -> bool {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_null() {
-            return false;
-        }
-
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid == 0 {
-            return false;
-        }
-
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if process.is_null() {
-            return false;
-        }
-
-        let mut buf = [0u16; 260];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) != 0;
-        CloseHandle(process);
-        if !ok || len == 0 {
-            return false;
-        }
-
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        path.rsplit(['\\', '/'])
-            .next()
-            .is_some_and(|exe| exe.eq_ignore_ascii_case(name))
     }
 
     unsafe fn vk_to_ascii(app: &App, vk: u32, scan: u32) -> Option<char> {
@@ -943,68 +904,6 @@ mod win {
         fn creation_flags(&mut self, flags: u32) -> &mut Self {
             use std::os::windows::process::CommandExt;
             CommandExt::creation_flags(self, flags)
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn backspace_inputs_use_virtual_key_and_marker() {
-            let mut inputs = Vec::new();
-            append_backspaces(&mut inputs, 1);
-
-            assert_eq!(inputs.len(), 2);
-            assert_eq!(inputs[0].r#type, INPUT_KEYBOARD);
-            unsafe {
-                assert_eq!(inputs[0].Anonymous.ki.wVk, VK_BACK);
-                assert_eq!(inputs[0].Anonymous.ki.wScan, 0);
-                assert_eq!(inputs[0].Anonymous.ki.dwFlags, 0);
-                assert_eq!(inputs[0].Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
-                assert_eq!(inputs[1].Anonymous.ki.wVk, VK_BACK);
-                assert_eq!(inputs[1].Anonymous.ki.wScan, 0);
-                assert_eq!(inputs[1].Anonymous.ki.dwFlags, KEYEVENTF_KEYUP);
-                assert_eq!(inputs[1].Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
-            }
-        }
-
-        #[test]
-        fn thorium_replacement_clears_inline_selection_first() {
-            let mut inputs = Vec::new();
-            append_key(&mut inputs, VK_DELETE);
-            append_backspaces(&mut inputs, 1);
-            append_text(&mut inputs, "â");
-
-            assert_eq!(inputs.len(), 6);
-            unsafe {
-                assert_eq!(inputs[0].Anonymous.ki.wVk, VK_DELETE);
-                assert_eq!(inputs[1].Anonymous.ki.wVk, VK_DELETE);
-                assert_eq!(inputs[2].Anonymous.ki.wVk, VK_BACK);
-                assert_eq!(inputs[3].Anonymous.ki.wVk, VK_BACK);
-                assert_eq!(inputs[4].Anonymous.ki.wScan, 'â' as u16);
-                assert_eq!(inputs[4].Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
-            }
-        }
-
-        #[test]
-        fn text_inputs_use_unicode_and_marker() {
-            let mut inputs = Vec::new();
-            append_text(&mut inputs, "â");
-
-            assert_eq!(inputs.len(), 2);
-            assert_eq!(inputs[0].r#type, INPUT_KEYBOARD);
-            unsafe {
-                assert_eq!(inputs[0].Anonymous.ki.wVk, 0);
-                assert_eq!(inputs[0].Anonymous.ki.wScan, 'â' as u16);
-                assert_eq!(inputs[0].Anonymous.ki.dwFlags, KEYEVENTF_UNICODE);
-                assert_eq!(inputs[0].Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
-                assert_eq!(
-                    inputs[1].Anonymous.ki.dwFlags,
-                    KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
-                );
-                assert_eq!(inputs[1].Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
-            }
         }
     }
 }
