@@ -117,21 +117,28 @@ fn strip_final(s: &str) -> &str {
 
 fn is_known_vowel_cluster(s: &str) -> bool {
     const CLUSTERS: &[&str] = &[
-        "a", "ă", "â", "e", "ê", "i", "o", "ô", "ơ", "u", "ư", "y", "ai", "ao", "au", "ay", "âu",
-        "ây", "eo", "êu", "ia", "iê", "iu", "oa", "oă", "oe", "oi", "ôi", "ơi", "oo", "ua", "uâ",
-        "ưa", "uê", "ui", "ưi", "uo", "uô", "ươ", "uy", "uya", "uyê", "ya", "ye", "yê", "uoi",
-        "uô", "ươ", "uye", "iê", "ie", "ua", "uo", "uơ",
+        "a", "e", "i", "o", "u", "y", "ai", "ao", "au", "ay", "eo", "eu", "ia", "ie", "iu", "oa",
+        "oe", "oi", "oo", "ua", "ue", "ui", "uo", "uu", "uy", "ya", "ye", "ieu", "oai", "oao",
+        "oay", "uay", "uoi", "uou", "uya", "uye", "uyu", "yeu",
     ];
     CLUSTERS.contains(&s)
 }
 
 fn has_repeated_tone_key(raw: &str) -> bool {
     let mut tone_count = 0usize;
+    let mut seen_vowel = false;
     for ch in raw.chars() {
-        if matches!(
-            ch,
-            's' | 'f' | 'r' | 'x' | 'j' | 'S' | 'F' | 'R' | 'X' | 'J'
-        ) {
+        if is_ascii_vowel_key(ch) {
+            seen_vowel = true;
+            continue;
+        }
+
+        if seen_vowel
+            && matches!(
+                ch,
+                's' | 'f' | 'r' | 'x' | 'j' | 'S' | 'F' | 'R' | 'X' | 'J'
+            )
+        {
             tone_count += 1;
             if tone_count > 1 {
                 return true;
@@ -139,6 +146,13 @@ fn has_repeated_tone_key(raw: &str) -> bool {
         }
     }
     false
+}
+
+fn is_ascii_vowel_key(ch: char) -> bool {
+    matches!(
+        ch,
+        'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'A' | 'E' | 'I' | 'O' | 'U' | 'Y'
+    )
 }
 
 fn is_vietnamese_marked_char(ch: char) -> bool {
@@ -177,7 +191,8 @@ mod tests {
     fn accepts_common_vietnamese_syllables() {
         for syllable in [
             "tiếng", "người", "được", "chuyên", "huyễn", "cuối", "muốn", "hoá", "thuý", "quý",
-            "tôi", "là", "chào",
+            "tôi", "là", "chào", "rất", "nhiều", "kêu", "đều", "hoài", "cừu", "huệ", "rượu",
+            "xoáy", "yếu",
         ] {
             assert!(is_likely_vietnamese_syllable(syllable), "{syllable}");
         }
@@ -201,5 +216,11 @@ mod tests {
     fn repeated_tone_is_invalid_composition() {
         let policy = classify_candidate("timmff", "tìmf");
         assert_eq!(policy.kind, CandidateKind::InvalidComposition);
+    }
+
+    #[test]
+    fn initial_tone_letters_are_consonants_not_repeated_tones() {
+        let policy = classify_candidate("raast", "rất");
+        assert_eq!(policy.kind, CandidateKind::Vietnamese);
     }
 }
