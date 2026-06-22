@@ -17,9 +17,11 @@ mod win {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::ptr::{null, null_mut};
-    use uvie_rs_win::context::current_app_context;
+    use uvie_rs_win::context::{AppContext, current_app_context};
     use uvie_rs_win::injector::{self, INJECTED_MARKER, Replacement};
-    use uvie_rs_win::profile::{InjectionStrategy, resolve_profile};
+    use uvie_rs_win::profile::{
+        AppProfile, ProfileRule, is_excluded_app, is_password_context, resolve_profile_with_rules,
+    };
     use uvie_rs_win::session::{Edit, SessionEngine};
     use windows_sys::Win32::Foundation::*;
     use windows_sys::Win32::Graphics::Gdi::*;
@@ -57,6 +59,10 @@ mod win {
         quick_telex: bool,
         #[serde(default)]
         debug_log: bool,
+        #[serde(default)]
+        rules: Vec<ProfileRule>,
+        #[serde(default)]
+        excluded_apps: Vec<String>,
     }
 
     impl Default for Config {
@@ -68,6 +74,8 @@ mod win {
                 hotkey: "Ctrl+Shift".to_string(),
                 quick_telex: false,
                 debug_log: false,
+                rules: Vec::new(),
+                excluded_apps: Vec::new(),
             }
         }
     }
@@ -89,6 +97,7 @@ mod win {
         exe_path: PathBuf,
         config_path: PathBuf,
         log_path: PathBuf,
+        app_context_cache: Option<AppContext>,
         ctrl_down: bool,
         shift_down: bool,
         alt_down: bool,
@@ -149,6 +158,7 @@ mod win {
                 exe_path,
                 config_path,
                 log_path,
+                app_context_cache: None,
                 ctrl_down: false,
                 shift_down: false,
                 alt_down: false,
@@ -331,6 +341,13 @@ mod win {
             return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
         }
 
+        let context = cached_app_context(app);
+        if let Some(reason) = passthrough_reason(app, &context) {
+            app.engine.reset();
+            log_passthrough(app, &context, reason);
+            return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
+        }
+
         if k.vkCode == VK_ESCAPE as u32 {
             app.engine.reset();
             return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
@@ -350,7 +367,8 @@ mod win {
         };
 
         if is_break_char(ch) {
-            let _ = app.engine.feed(ch);
+            let edit = app.engine.feed(ch);
+            apply_edit(app, edit);
             return CallNextHookEx(app.keyboard_hook, code, wparam, lparam);
         }
 
@@ -373,6 +391,7 @@ mod win {
             let app = &mut *APP;
             refresh_modifier_state(app);
             app.engine.reset();
+            app.app_context_cache = None;
         }
         CallNextHookEx(null_mut(), code, wparam, lparam)
     }
@@ -390,6 +409,7 @@ mod win {
             let app = &mut *APP;
             refresh_modifier_state(app);
             app.engine.reset();
+            app.app_context_cache = None;
         }
     }
 
@@ -397,21 +417,81 @@ mod win {
         match edit {
             Edit::Pass => {}
             Edit::Replace { backspaces, text } => {
-                let context = current_app_context();
-                let profile = resolve_profile(&context);
+                let context = cached_app_context(app);
+                let profile = resolve_profile_with_rules(&context, &app.config.rules);
                 let replacement = Replacement::new(backspaces, text);
-                log_replacement(app, &context, profile.strategy, &replacement);
-                if !injector::send_replacement(profile.strategy, &replacement) {
+                log_replacement(app, &context, &profile, &replacement);
+                let strategy_chain = profile.strategy_chain();
+                let report =
+                    injector::send_replacement_with_fallback(&strategy_chain, &replacement);
+                if !report.success {
                     app.engine.reset();
                 }
             }
         }
     }
 
+    fn cached_app_context(app: &mut App) -> AppContext {
+        if let Some(context) = &app.app_context_cache {
+            return context.clone();
+        }
+        let context = current_app_context();
+        app.app_context_cache = Some(context.clone());
+        context
+    }
+
+    fn passthrough_reason(app: &App, context: &AppContext) -> Option<&'static str> {
+        if is_excluded_app(context, &app.config.excluded_apps) {
+            return Some("excludedApp");
+        }
+        if is_password_context(context) {
+            return Some("passwordField");
+        }
+        None
+    }
+
+    fn log_passthrough(app: &App, context: &AppContext, reason: &str) {
+        if !app.config.debug_log {
+            return;
+        }
+
+        let exe = context.exe_name.as_deref().unwrap_or("<unknown>");
+        let title = context.window_title.as_deref().unwrap_or("");
+        let class = context.class_name.as_deref().unwrap_or("");
+        let focus = context.focus.as_ref();
+        let focus_type = focus
+            .and_then(|focus| focus.control_type.as_deref())
+            .unwrap_or("");
+        let focus_name = if focus.map(|focus| focus.is_password).unwrap_or(false) {
+            "<password>"
+        } else {
+            focus.and_then(|focus| focus.name.as_deref()).unwrap_or("")
+        };
+        let automation_id = focus
+            .and_then(|focus| focus.automation_id.as_deref())
+            .unwrap_or("");
+        let focus_class = focus
+            .and_then(|focus| focus.class_name.as_deref())
+            .unwrap_or("");
+        let line = format!(
+            "exe={} title=\"{}\" class={} focusType={} focusName=\"{}\" focusClass={} automationId={} behavior=PassThrough strategy=PassThrough reason={}\n",
+            exe,
+            title.replace('"', "'"),
+            class,
+            focus_type,
+            focus_name.replace('"', "'"),
+            focus_class,
+            automation_id,
+            reason
+        );
+
+        append_debug_log(app, &line);
+    }
+
     fn log_replacement(
         app: &App,
-        context: &uvie_rs_win::context::AppContext,
-        strategy: InjectionStrategy,
+        context: &AppContext,
+        profile: &AppProfile,
         replacement: &Replacement,
     ) {
         if !app.config.debug_log {
@@ -420,17 +500,47 @@ mod win {
 
         let exe = context.exe_name.as_deref().unwrap_or("<unknown>");
         let title = context.window_title.as_deref().unwrap_or("");
+        let class = context.class_name.as_deref().unwrap_or("");
+        let focus = context.focus.as_ref();
+        let focus_type = focus
+            .and_then(|focus| focus.control_type.as_deref())
+            .unwrap_or("");
+        let focus_name = if focus.map(|focus| focus.is_password).unwrap_or(false) {
+            "<password>"
+        } else {
+            focus.and_then(|focus| focus.name.as_deref()).unwrap_or("")
+        };
+        let automation_id = focus
+            .and_then(|focus| focus.automation_id.as_deref())
+            .unwrap_or("");
+        let focus_class = focus
+            .and_then(|focus| focus.class_name.as_deref())
+            .unwrap_or("");
         let line = format!(
-            "exe={} title=\"{}\" strategy={:?} raw=\"{}\" visible=\"{}\" edit=Replace({},\"{}\")\n",
+            "exe={} title=\"{}\" class={} focusType={} focusName=\"{}\" focusClass={} automationId={} behavior={:?} strategy={:?} strategyChain={:?} reason={:?} confidence={:?} ruleName={} raw=\"{}\" visible=\"{}\" edit=Replace({},\"{}\")\n",
             exe,
             title.replace('"', "'"),
-            strategy,
+            class,
+            focus_type,
+            focus_name.replace('"', "'"),
+            focus_class,
+            automation_id,
+            profile.behavior,
+            profile.strategy,
+            profile.strategy_chain(),
+            profile.reason,
+            profile.confidence,
+            profile.rule_name.unwrap_or(""),
             app.engine.raw().replace('"', "'"),
             app.engine.visible().replace('"', "'"),
             replacement.backspaces,
             replacement.text.replace('"', "'")
         );
 
+        append_debug_log(app, &line);
+    }
+
+    fn append_debug_log(app: &App, line: &str) {
         if let Ok(mut file) = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -904,6 +1014,69 @@ mod win {
         fn creation_flags(&mut self, flags: u32) -> &mut Self {
             use std::os::windows::process::CommandExt;
             CommandExt::creation_flags(self, flags)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Config;
+        use uvie_rs_win::profile::{AppBehavior, InjectionStrategy};
+
+        #[test]
+        fn old_config_without_rules_or_excluded_apps_still_loads() {
+            let config: Config = serde_json::from_str(
+                r#"{
+                    "enabled": true,
+                    "runAtStartup": false,
+                    "runAsAdmin": false,
+                    "hotkey": "Ctrl+Shift",
+                    "quickTelex": false,
+                    "debugLog": false
+                }"#,
+            )
+            .unwrap();
+
+            assert!(config.rules.is_empty());
+            assert!(config.excluded_apps.is_empty());
+        }
+
+        #[test]
+        fn rule_and_excluded_apps_config_loads() {
+            let config: Config = serde_json::from_str(
+                r#"{
+                    "enabled": true,
+                    "runAtStartup": false,
+                    "runAsAdmin": false,
+                    "hotkey": "Ctrl+Shift",
+                    "quickTelex": false,
+                    "rules": [
+                        {
+                            "exe": "thorium.exe",
+                            "titleContains": "Google Docs",
+                            "behavior": "BrowserTextField",
+                            "strategy": "SlowBackspaceText",
+                            "fallbackStrategies": ["BackspaceText"]
+                        }
+                    ],
+                    "excludedApps": ["game.exe"]
+                }"#,
+            )
+            .unwrap();
+
+            assert_eq!(config.rules.len(), 1);
+            assert_eq!(
+                config.rules[0].behavior,
+                Some(AppBehavior::BrowserTextField)
+            );
+            assert_eq!(
+                config.rules[0].strategy,
+                Some(InjectionStrategy::SlowBackspaceText)
+            );
+            assert_eq!(
+                config.rules[0].fallback_strategies,
+                [InjectionStrategy::BackspaceText]
+            );
+            assert_eq!(config.excluded_apps, ["game.exe"]);
         }
     }
 }

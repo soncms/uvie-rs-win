@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "runAtStartup": false,
+  "runAsAdmin": false,
+  "hotkey": "Ctrl+Shift",
+  "quickTelex": false,
+  "debugLog": false,
+  "rules": [
+    {
+      "name": "example-google-docs",
+      "enabled": true,
+      "exe": "chrome.exe",
+      "titleContains": "Google Docs",
+      "behavior": "BrowserTextField",
+      "strategy": "SlowBackspaceText",
+      "fallbackStrategies": ["BackspaceText"]
+    },
+    {
+      "name": "example-web-editor-focus",
+      "enabled": true,
+      "exe": "thorium.exe",
+      "automationIdContains": "editable",
+      "behavior": "BrowserTextField",
+      "strategy": "BackspaceText",
+      "fallbackStrategies": ["SlowBackspaceText"]
+    }
+  ],
+  "excludedApps": ["game.exe", "someapp.exe"]
+}

@@ -1,5 +1,7 @@
 use crate::profile::InjectionStrategy;
 use std::mem::{size_of, zeroed};
+use std::thread;
+use std::time::Duration;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
     VIRTUAL_KEY, VK_BACK, VK_DELETE,
@@ -12,6 +14,13 @@ const EMPTY_PREFIX: &str = "\u{202f}";
 pub struct Replacement {
     pub backspaces: usize,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendReport {
+    pub success: bool,
+    pub attempted: Vec<InjectionStrategy>,
+    pub used_strategy: Option<InjectionStrategy>,
 }
 
 impl Replacement {
@@ -47,8 +56,66 @@ pub fn build_inputs(strategy: InjectionStrategy, replacement: &Replacement) -> V
 }
 
 pub fn send_replacement(strategy: InjectionStrategy, replacement: &Replacement) -> bool {
+    if strategy == InjectionStrategy::SlowBackspaceText {
+        return send_slow_replacement(replacement);
+    }
+
     let mut inputs = build_inputs(strategy, replacement);
     unsafe { send_inputs(&mut inputs) }
+}
+
+pub fn send_replacement_with_fallback(
+    strategies: &[InjectionStrategy],
+    replacement: &Replacement,
+) -> SendReport {
+    let mut attempted = Vec::new();
+    let chain = normalize_strategy_chain(strategies);
+
+    for strategy in chain {
+        attempted.push(strategy);
+        if send_replacement(strategy, replacement) {
+            return SendReport {
+                success: true,
+                attempted,
+                used_strategy: Some(strategy),
+            };
+        }
+    }
+
+    SendReport {
+        success: false,
+        attempted,
+        used_strategy: None,
+    }
+}
+
+pub fn normalize_strategy_chain(strategies: &[InjectionStrategy]) -> Vec<InjectionStrategy> {
+    let mut normalized = Vec::new();
+    for strategy in strategies {
+        if !normalized.contains(strategy) {
+            normalized.push(*strategy);
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push(InjectionStrategy::BackspaceText);
+    }
+    normalized
+}
+
+fn send_slow_replacement(replacement: &Replacement) -> bool {
+    let mut backspaces = Vec::with_capacity(replacement.backspaces * 2);
+    append_backspaces(&mut backspaces, replacement.backspaces);
+    if unsafe { !send_inputs(&mut backspaces) } {
+        return false;
+    }
+
+    if replacement.backspaces > 0 && !replacement.text.is_empty() {
+        thread::sleep(Duration::from_millis(3));
+    }
+
+    let mut text = Vec::with_capacity(replacement.text.encode_utf16().count() * 2);
+    append_text(&mut text, &replacement.text);
+    unsafe { send_inputs(&mut text) }
 }
 
 fn append_backspaces(inputs: &mut Vec<INPUT>, count: usize) {
@@ -193,6 +260,25 @@ mod tests {
                 assert_eq!(input.Anonymous.ki.dwExtraInfo, INJECTED_MARKER);
             }
         }
+    }
+
+    #[test]
+    fn strategy_chain_deduplicates_and_defaults() {
+        assert_eq!(
+            normalize_strategy_chain(&[
+                InjectionStrategy::BackspaceText,
+                InjectionStrategy::BackspaceText,
+                InjectionStrategy::SlowBackspaceText,
+            ]),
+            vec![
+                InjectionStrategy::BackspaceText,
+                InjectionStrategy::SlowBackspaceText,
+            ]
+        );
+        assert_eq!(
+            normalize_strategy_chain(&[]),
+            vec![InjectionStrategy::BackspaceText]
+        );
     }
 
     fn input_signature(inputs: &[INPUT]) -> Vec<(VIRTUAL_KEY, u16, KEYBD_EVENT_FLAGS)> {

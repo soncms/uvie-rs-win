@@ -1,3 +1,4 @@
+use crate::telex_policy::{CandidateKind, classify_candidate};
 use uvie::{InputMethod, UltraFastViEngine};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,12 +7,36 @@ pub enum Edit {
     Pass,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionState {
+    Idle,
+    Composing,
+    CommittedBoundary,
+    TemporarilyRestored,
+    UserRejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    raw: String,
+    visible: String,
+}
+
+impl Snapshot {
+    fn new(raw: String, visible: String) -> Self {
+        Self { raw, visible }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionEngine {
     raw: String,
     visible: String,
-    before_boundary: Option<(String, String)>,
+    before_boundary: Option<Snapshot>,
+    last_good: Option<Snapshot>,
+    state: SessionState,
     quick_telex: bool,
+    literal_mode: bool,
 }
 
 impl Default for SessionEngine {
@@ -26,7 +51,10 @@ impl SessionEngine {
             raw: String::new(),
             visible: String::new(),
             before_boundary: None,
+            last_good: None,
+            state: SessionState::Idle,
             quick_telex,
+            literal_mode: false,
         }
     }
 
@@ -34,6 +62,9 @@ impl SessionEngine {
         self.raw.clear();
         self.visible.clear();
         self.before_boundary = None;
+        self.last_good = None;
+        self.state = SessionState::Idle;
+        self.literal_mode = false;
     }
 
     pub fn is_composing(&self) -> bool {
@@ -50,10 +81,13 @@ impl SessionEngine {
 
     pub fn feed(&mut self, ch: char) -> Edit {
         if Self::is_boundary(ch) {
-            self.before_boundary =
-                (!self.raw.is_empty()).then(|| (self.raw.clone(), self.visible.clone()));
+            self.before_boundary = (!self.raw.is_empty())
+                .then(|| Snapshot::new(self.raw.clone(), self.visible.clone()));
             self.raw.clear();
             self.visible.clear();
+            self.last_good = None;
+            self.state = SessionState::CommittedBoundary;
+            self.literal_mode = false;
             return Edit::Pass;
         }
 
@@ -62,6 +96,14 @@ impl SessionEngine {
             return Edit::Pass;
         }
 
+        if self.literal_mode {
+            self.state = SessionState::UserRejected;
+            return Edit::Pass;
+        }
+
+        if matches!(self.state, SessionState::TemporarilyRestored) {
+            self.state = SessionState::Idle;
+        }
         self.before_boundary = None;
 
         let before = self.visible.clone();
@@ -78,7 +120,7 @@ impl SessionEngine {
 
         if self.should_restore_raw(ch, &candidate_raw, &candidate) {
             let backspaces = before.chars().count();
-            self.reset();
+            self.restore_temporarily();
             return Edit::Replace {
                 backspaces,
                 text: candidate_raw,
@@ -86,12 +128,16 @@ impl SessionEngine {
         }
 
         if self.should_restore_literal(ch, &candidate_raw, &candidate) {
-            self.reset();
+            self.restore_temporarily();
             return Edit::Pass;
         }
 
         self.raw = candidate_raw;
         self.visible = candidate;
+        self.state = SessionState::Composing;
+        if self.visible != self.raw {
+            self.last_good = Some(Snapshot::new(self.raw.clone(), self.visible.clone()));
+        }
 
         let (backspaces, text) = diff(&before, &self.visible);
         if backspaces == 0 && text == ch.to_string() {
@@ -115,6 +161,11 @@ impl SessionEngine {
 
         self.raw = raw;
         self.visible = rendered;
+        self.state = if self.raw.is_empty() {
+            SessionState::Idle
+        } else {
+            SessionState::Composing
+        };
         Edit::Replace {
             backspaces: 1,
             text: String::new(),
@@ -122,12 +173,23 @@ impl SessionEngine {
     }
 
     pub fn restore_after_boundary_backspace(&mut self) -> bool {
-        let Some((raw, visible)) = self.before_boundary.take() else {
+        let Some(snapshot) = self.before_boundary.take() else {
             return false;
         };
-        self.raw = raw;
-        self.visible = visible;
+        self.raw = snapshot.raw;
+        self.visible = snapshot.visible;
+        self.state = SessionState::Composing;
+        self.literal_mode = false;
         true
+    }
+
+    fn restore_temporarily(&mut self) {
+        self.raw.clear();
+        self.visible.clear();
+        self.before_boundary = None;
+        self.last_good = None;
+        self.state = SessionState::TemporarilyRestored;
+        self.literal_mode = true;
     }
 
     fn render(&self, raw: &str) -> String {
@@ -226,7 +288,18 @@ impl SessionEngine {
             return false;
         }
 
+        if let Some(last_good) = &self.last_good
+            && last_good.visible == self.visible
+            && candidate == raw
+        {
+            return true;
+        }
+
         if candidate == raw {
+            return true;
+        }
+
+        if classify_candidate(raw, candidate).kind == CandidateKind::InvalidComposition {
             return true;
         }
 
@@ -346,12 +419,27 @@ fn has_u_horn_before(chars: &[char], end: usize) -> bool {
 mod tests {
     use super::{Edit, SessionEngine};
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum Trace {
+        Pass(char),
+        Replace(usize, String),
+    }
+
     fn type_seq(engine: &mut SessionEngine, seq: &str) -> String {
         let mut screen = String::new();
         for ch in seq.chars() {
             apply(&mut screen, engine.feed(ch), ch);
         }
         screen
+    }
+
+    fn trace_seq(engine: &mut SessionEngine, seq: &str) -> Vec<Trace> {
+        seq.chars()
+            .map(|ch| match engine.feed(ch) {
+                Edit::Pass => Trace::Pass(ch),
+                Edit::Replace { backspaces, text } => Trace::Replace(backspaces, text),
+            })
+            .collect()
     }
 
     fn apply(screen: &mut String, edit: Edit, original: char) {
@@ -461,10 +549,40 @@ mod tests {
 
     #[test]
     fn english_passthrough() {
-        for word in ["account", "window", "google", "workflow"] {
+        for word in [
+            "account", "window", "google", "workflow", "show", "browser", "search", "power",
+        ] {
             let mut e = SessionEngine::default();
             assert_eq!(type_seq(&mut e, word), word);
         }
+    }
+
+    #[test]
+    fn invalid_restore_replaces_composed_prefix_with_raw_literal() {
+        let mut e = SessionEngine::default();
+        let trace = trace_seq(&mut e, "goog");
+        assert_eq!(
+            trace,
+            vec![
+                Trace::Pass('g'),
+                Trace::Pass('o'),
+                Trace::Replace(1, "ô".to_string()),
+                Trace::Replace(2, "goog".to_string()),
+            ]
+        );
+        assert_eq!(type_seq(&mut SessionEngine::default(), "google"), "google");
+    }
+
+    #[test]
+    fn restored_word_does_not_recompose_until_new_input_naturally_starts() {
+        let mut e = SessionEngine::default();
+        assert_eq!(type_seq(&mut e, "workflow"), "workflow");
+    }
+
+    #[test]
+    fn restored_word_stays_literal_until_boundary() {
+        let mut e = SessionEngine::default();
+        assert_eq!(type_seq(&mut e, "goog tieengs"), "goog tiếng");
     }
 
     #[test]

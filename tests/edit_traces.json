@@ -1,0 +1,26 @@
+[
+  {
+    "name": "space-delete-continue-composes",
+    "events": ["g", "o", " ", "<BS>", "o"],
+    "expectedScreens": ["g", "go", "go ", "go", "gô"],
+    "expectedFinal": "gô"
+  },
+  {
+    "name": "invalid-english-restore-stays-literal",
+    "events": ["g", "o", "o", "g", "l", "e"],
+    "expectedScreens": ["g", "go", "gô", "goog", "googl", "google"],
+    "expectedFinal": "google"
+  },
+  {
+    "name": "literal-mode-resets-after-boundary",
+    "events": ["g", "o", "o", "g", " ", "t", "i", "e", "e", "n", "g", "s"],
+    "expectedScreens": ["g", "go", "gô", "goog", "goog ", "goog t", "goog ti", "goog tie", "goog tiê", "goog tiên", "goog tiêng", "goog tiếng"],
+    "expectedFinal": "goog tiếng"
+  },
+  {
+    "name": "repeated-tone-stays-literal",
+    "events": ["t", "i", "m", "m", "f", "f"],
+    "expectedScreens": ["t", "ti", "tim", "timm", "timmf", "timmff"],
+    "expectedFinal": "timmff"
+  }
+]
